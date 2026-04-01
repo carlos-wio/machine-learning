@@ -1,0 +1,449 @@
+
+WITH customer_months AS (
+  SELECT
+    c.customer_id,
+    CAST(DATE_TRUNC('month', exploded_month) AS DATE) AS month,
+    country_of_birth_code,
+    gender,
+    occupation,
+    employment_info,
+    source_of_funds,
+    -- Age at observation date
+    ROUND(DATE_DIFF(last_day(exploded_month), date_of_birth)/365.25, 0) AS customer_age,
+    -- Employment is housewife (bool)
+    CASE WHEN lower(replace(occupation, ' ', '')) like '%housewife%' THEN TRUE ELSE FALSE END AS is_housewife, -- Update with Generation Shaper new naming
+    -- Number of days since Emirates ID was issued
+    DATE_DIFF(last_day(exploded_month), emirates_id_issue_date) AS days_from_eid_issued,
+    -- Self declared salary during On Boarding
+    COALESCE(monthly_income, (income_lower_limit + income_upper_limit) / 2) AS self_declared_salary,
+    -- Days since account created
+    DATE_DIFF(last_day(exploded_month), mambu_creation_date) AS customer_tenure_days,
+    -- Months since account created
+    round(DATE_DIFF(last_day(exploded_month), mambu_creation_date)/30, 0) AS customer_tenure_months
+  FROM prod.retail_semantic_db.vw_retail_customer_master c
+  LATERAL VIEW EXPLODE(
+    SEQUENCE(
+      DATE_TRUNC('month', c.mambu_creation_date),
+      DATE_TRUNC('month', CURRENT_DATE()),
+      INTERVAL 1 MONTH
+    )
+  ) AS exploded_month
+  WHERE MIS_status = "Approved" --Active users
+  --OR MIS_status = "Exited" AND exploded_month < profile_updated_on) --Users active in the past but dropped, just considering the active months
+  AND c.mambu_creation_date > DATE("2024-01-01")
+  AND c.is_blacklisted_for_lending = FALSE -- Exclude blacklisted customers
+),
+
+credit_card_approved_applications AS ( -- Approved CC applications
+  SELECT customer_id, 
+    min(application_decision_time) as first_approval
+  FROM prod.lending_enterprise_db.all_retail_applications
+  WHERE product_type = "CREDIT_CARD" -- This can contain direct applications to credit card
+    AND application_flow_type = "CREDIT" 
+    AND (application_decision = "APPROVED" -- This field is more accurate than application_status 
+    OR account_id IS NOT NULL)
+  GROUP BY 1
+),
+
+credit_card_application_submissions AS ( -- CC application submissions
+  SELECT application_id,
+       customer_id,
+       application_created_time,
+       application_submitted_time,
+       entry_point_type,
+       application_status,
+       application_decision, -- More granular detail than
+       CASE
+        WHEN application_decision='APPROVED' OR account_id IS NOT NULL THEN 'APPROVED'
+        WHEN application_decision IN ('REJECTED','HARD_REJECTED') THEN 'REJECTED'
+        WHEN application_decision='IN_REVIEW' THEN 'WIP'
+        ELSE 'Other'
+       END AS cc_application_decision_category
+  FROM prod.lending_enterprise_db.all_retail_applications
+  WHERE entry_product_type = "CREDIT_CARD" -- Only considering applications to CC through CC flow, to capture customer's willingness to apply for CC
+    AND application_flow_type = "CREDIT"
+    AND application_submitted_time IS NOT NULL -- Just considering submitted applications
+),
+
+customer_base AS (
+  SELECT c.customer_id,
+        c.month,
+        c.customer_age,
+        c.country_of_birth_code,
+        c.gender,
+        c.is_housewife,
+        c.days_from_eid_issued,
+        c.employment_info,
+        c.self_declared_salary,
+        c.source_of_funds,
+        c.customer_tenure_days,
+        c.customer_tenure_months,
+        cca.first_approval AS first_approval_NO_FEAT,
+        ccs.application_submitted_time AS application_submitted_time_NO_FEAT,
+        ccs.cc_application_decision_category AS cc_application_decision_category_NO_FEAT,
+        CASE WHEN ccs.application_id IS NULL THEN 0 ELSE 1 END AS cc_application_sumbitted_TARGET_LABEL
+  FROM customer_months c
+    LEFT JOIN credit_card_approved_applications cca
+      ON c.customer_id = cca.customer_id
+    LEFT JOIN credit_card_application_submissions ccs
+      ON c.customer_id = ccs.customer_id
+        AND ccs.application_submitted_time BETWEEN month AND last_day(month)
+  WHERE (last_day(c.month) <= last_day(cca.first_approval) OR cca.first_approval IS NULL) -- Considering users with no approved applications and user history before the first application
+    AND last_day(c.month) < current_date() -- Just considering completed months
+),
+
+salary AS (
+         SELECT c.CUSTOMER_ID as customer_id,
+              CAST(DATE_TRUNC('month', month_date) AS DATE) AS month,
+              total_monthly_salary,
+              SUM(CASE WHEN s.total_monthly_salary IS NOT NULL THEN 1 ELSE 0 END) OVER (
+                  PARTITION BY c.customer_id
+                  ORDER BY c.month
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+              ) AS prior_months_with_salary,
+              LAG(CASE WHEN s.total_monthly_salary IS NOT NULL THEN 1 ELSE 0 END) OVER (
+                      PARTITION BY c.customer_id
+                      ORDER BY c.month
+                  ) AS received_salary_previous_month,
+              AVG(s.total_monthly_salary) OVER (
+                  PARTITION BY c.customer_id
+                  ORDER BY c.month
+                  ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+              ) AS avg_salary_last_3_months
+        FROM customer_months c
+          JOIN self_service.self_serve_retail.salary_transfers s
+            ON s.customer_id = c.customer_id 
+              AND CAST(DATE_TRUNC('month', s.month_date) AS DATE) = c.month
+),
+
+balances AS (
+  SELECT customer_id, 
+        CAST(DATE_TRUNC('month', eod_date) AS DATE) AS month,
+        card_holder_category,
+        balance_aed,
+        balance_all_current_account_aed                 AS current_account_balance,
+        balance_all_savings_account_aed                 AS savings_balance,
+        CASE WHEN balance_all_savings_account_aed > 0 THEN True ELSE False END as has_savings,
+        invest_balance_aed                              AS invest_balance,
+        CASE WHEN invest_balance_aed > 0 THEN True ELSE False END as has_invest,
+        balance_aed_with_invest                         AS total_balance_with_invest, -- Total balances + invest
+        -- Pre-computed rolling averages
+        average_balance_aed_last30days                  AS avg_balance_30d,
+        average_balance_aed_last60days                  AS avg_balance_60d,
+        average_balance_aed_last90days                  AS avg_balance_90d,
+        average_balance_aed_last180days                 AS avg_balance_180d,
+        average_balance_aed_last365days                 AS avg_balance_365d,
+        -- Balance with investments rolling
+        average_balance_aed_with_invest_last30days      AS avg_balance_with_invest_30d,
+        average_balance_aed_with_invest_last90days      AS avg_balance_with_invest_90d,
+        -- Balance trend: recent vs longer-term
+        CASE
+          WHEN average_balance_aed_last90days > 0
+          THEN average_balance_aed_last30days / average_balance_aed_last90days
+          ELSE NULL
+        END                                                 AS balance_trend_30d_vs_90d,
+        CASE
+          WHEN average_balance_aed_last180days > 0
+          THEN average_balance_aed_last90days / average_balance_aed_last180days
+          ELSE NULL
+        END                                                 AS balance_trend_90d_vs_180d,
+        -- Month-over-month balance change
+        CASE
+          WHEN balance_aed_prev_month_end > 0
+          THEN (balance_aed - balance_aed_prev_month_end) / balance_aed_prev_month_end
+          ELSE NULL
+        END                                                 AS balance_mom_change
+  FROM analytics_retail.banking_core.customer_stats_daily
+  WHERE eod_date = last_day(eod_date)
+),
+
+spending_rolling_window AS (
+  SELECT customer_id,
+         eod_date,
+         -- Daily spend (raw)
+         SUM(total_spend_debitcard) OVER w             AS total_spend_debitcard_30d,
+         SUM(num_spend_debitcard) OVER w               AS num_spend_debitcard_30d,
+         -- Channel split
+         SUM(total_spend_online_debitcard) OVER w      AS daily_spend_online_30d,
+         SUM(total_spend_pos_debitcard) OVER w         AS daily_spend_pos_30d,
+         SUM(total_spend_wallet_debitcard) OVER w      AS daily_spend_wallet_30d,
+         -- Cashback
+         SUM(cashback_on_debit) OVER w AS cashback_on_debit_30d
+  FROM analytics_retail.banking_core.spend_daily
+
+  WINDOW w AS (
+        ORDER BY eod_date
+        ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    )
+),
+
+spending_rolling_window_filtered AS (
+  SELECT customer_id,
+        CAST(DATE_TRUNC('month', eod_date) AS DATE) AS month,
+        total_spend_debitcard_30d,
+        num_spend_debitcard_30d,
+        daily_spend_online_30d,
+        daily_spend_pos_30d,
+        daily_spend_wallet_30d,
+        cashback_on_debit_30d
+  FROM spending_rolling_window
+  WHERE eod_date = last_day(eod_date)
+),
+
+spending AS ( -- Since not all fields have pre-computed rolling windows, I will do it manually
+  SELECT customer_id,
+    CAST(DATE_TRUNC('month', eod_date) AS DATE) AS month,
+    -- Pre-computed rolling sums (debit card)
+    sum_last30days_debitcard_spend_amount_aed        AS spend_30d_debitcard,
+    sum_last90days_debitcard_spend_amount_aed        AS spend_90d_debitcard,
+    sum_last365days_debitcard_spend_amount_aed       AS spend_365d_debitcard,
+    -- Pre-computed total spend rolling sums
+    sum_last30days_total_spend_amount_aed            AS spend_30d_total,
+    sum_last60days_total_spend_amount_aed            AS spend_60d_total,
+    sum_last90days_total_spend_amount_aed            AS spend_90d_total,
+    sum_last365days_total_spend_amount_aed           AS spend_365d_total,
+    -- Average daily spend
+    avg_last30days_total_spend_amount_aed            AS avg_daily_spend_30d,
+    avg_last90days_total_spend_amount_aed            AS avg_daily_spend_90d,
+    -- Domestic vs international split (pre-computed rolling)
+    sum_last30days_debitcard_spend_amount_domestic   AS spend_30d_domestic,
+    sum_last90days_debitcard_spend_amount_domestic   AS spend_90d_domestic,
+    -- Category spend (pre-computed rolling) -- Not reliable categories yet
+    --sum_last30days_debitcard_spend_restaurant        AS spend_30d_restaurant,
+    --sum_last30days_debitcard_spend_grocery           AS spend_30d_grocery,
+    --sum_last30days_debitcard_spend_shopping          AS spend_30d_shopping,
+    --sum_last30days_debitcard_spend_travel            AS spend_30d_travel,
+    --sum_last30days_debitcard_spend_entertainemnt     AS spend_30d_entertainment,
+    --sum_last30days_debitcard_spend_education         AS spend_30d_education,
+    --sum_last30days_debitcard_spend_transport         AS spend_30d_transport,
+    --sum_last30days_debitcard_spend_health            AS spend_30d_health,
+    --sum_last30days_debitcard_spend_rent              AS spend_30d_rent,
+    --sum_last30days_debitcard_spend_util              AS spend_30d_utilities,
+    -- Derived: spend acceleration (30d annualized vs 90d)
+    CASE
+      WHEN sum_last90days_total_spend_amount_aed > 0
+      THEN (sum_last30days_total_spend_amount_aed * 3) / sum_last90days_total_spend_amount_aed
+      ELSE NULL
+    END                                                 AS spend_acceleration_30d_vs_90d,
+    -- Derived: international spend ratio
+    CASE
+      WHEN sum_last30days_debitcard_spend_amount_aed > 0
+      THEN 1.0 - (sum_last30days_debitcard_spend_amount_domestic / sum_last30days_debitcard_spend_amount_aed)
+      ELSE 0
+    END                                                 AS international_spend_ratio_30d
+  FROM analytics_retail.banking_core.spend_daily
+  WHERE eod_date = last_day(eod_date)
+),
+
+transfers_income AS (
+  SELECT
+    td.customer_id,
+    CAST(DATE_TRUNC('month', td.eod_date) AS DATE) AS month,
+    -- Salary inflows (pre-computed rolling sums)
+    td.sum_last30days_total_value_salary_in             AS salary_in_30d,
+    td.sum_last90days_total_value_salary_in             AS salary_in_90d,
+    td.sum_last180days_total_value_salary_in            AS salary_in_180d,
+    td.sum_last365days_total_value_salary_in            AS salary_in_365d,
+    td.sum_last30days_total_num_salary_in               AS salary_count_30d,
+    td.sum_last90days_total_num_salary_in               AS salary_count_90d,
+    -- Average salary
+    td.avg_total_inward_salary_last30days               AS avg_salary_in_30d,
+    td.avg_total_inward_salary_last90days               AS avg_salary_in_90d,
+    -- Total inflows (pre-computed rolling)
+    td.sum_last30days_total_value_inward                AS total_inflows_30d,
+    td.sum_last90days_total_value_inward                AS total_inflows_90d,
+    -- Cash deposits
+    td.sum_last30days_total_num_cash_deposit            AS total_cash_deposit_30d,
+    td.days_since_last_cash_deposit,
+    -- Local transfers
+    td.sum_last30days_total_value_local_payment_in      AS total_value_local_transfer_in_30d,
+    td.sum_last30days_total_value_local_payment_out     AS total_value_local_transfer_out_30d,
+    -- International transfers
+    td.sum_last30days_total_value_international_in      AS total_value_international_transfer_in_30d,
+    td.sum_last30days_total_value_international_out     AS total_value_international_transfer_out_30d,
+    -- ATM withdrawals
+    td.sum_last30days_total_value_atm_withdrawal        AS total_value_atm_withdrawal_30d,
+    td.days_since_last_cash_withdrawal,
+    -- Outflows
+    td.sum_last30days_total_value_outward               AS total_value_outflow_30d,
+    td.sum_last90days_total_value_outward               AS total_value_outflow_90d,
+    -- Salary regularity: salary received in at least 3 of last 3 months
+    CASE
+      WHEN td.sum_last90days_total_num_salary_in >= 3 THEN 'REGULAR'
+      WHEN td.sum_last90days_total_num_salary_in >= 1 THEN 'IRREGULAR'
+      ELSE 'NO_SALARY'
+    END                                                 AS salary_regularity,
+    -- Average monthly salary (90d / 3 months)
+    COALESCE(td.sum_last90days_total_value_salary_in, 0) / 3.0 AS avg_monthly_salary_90d,
+    -- Salary-to-outflow ratio
+        CASE
+      WHEN td.sum_last30days_total_value_outward > 0
+      THEN td.sum_last30days_total_value_salary_in / td.sum_last30days_total_value_outward
+      ELSE NULL
+    END                                                 AS salary_to_outflow_ratio_30d,
+    CASE
+      WHEN td.sum_last90days_total_value_outward > 0
+      THEN td.sum_last90days_total_value_salary_in / td.sum_last90days_total_value_outward
+      ELSE NULL
+    END                                                 AS salary_to_outflow_ratio_90d
+  FROM analytics_retail.banking_core.transfers_daily td
+  WHERE eod_date = last_day(eod_date)
+),
+
+loans AS (
+  SELECT
+      l.customer_id,
+      CAST(DATE_TRUNC('month', l.eod) AS DATE) AS month,
+      True AS has_active_loan,
+      COUNT(DISTINCT l.account_id)              AS num_active_loans,
+      SUM(l.full_loan_amount)                   AS total_loan_amount,
+      SUM(l.outstanding_incl_fees)              AS total_loan_outstanding,
+      max(l.installments_period)                AS total_loan_installments -- Number of months untill all loans are paid back
+    FROM prod.lending_enterprise_db.loans_stats_daily l
+    WHERE l.account_status NOT IN ('CLOSED')
+      AND l.eod = last_day(l.eod)
+    GROUP BY 1, 2
+),
+
+lending_application_history AS (
+  SELECT
+    c.customer_id,
+    c.month,
+    -- Prior credit card applications
+    COUNT(DISTINCT CASE WHEN ara.product_type = 'CREDIT_CARD' THEN ara.application_id END) AS num_prior_cc_applications,
+     -- Prior personal loan applications
+    COUNT(DISTINCT CASE WHEN ara.product_type = 'PERSONAL_LOAN' THEN ara.application_id END) AS num_prior_pl_applications,
+    -- Months since last application
+    DATEDIFF(last_day(c.month), MAX(ara.application_submitted_time))/30.44 AS months_since_last_application
+  FROM prod.lending_enterprise_db.all_retail_applications ara 
+    JOIN customer_base c
+      ON c.customer_id = ara.customer_id
+        AND application_submitted_time < month
+    WHERE ara.product_type IN ('CREDIT_CARD', 'PERSONAL_LOAN')
+  GROUP BY 1, 2
+)
+-- Customer attributes
+SELECT c.customer_id,
+       c.month,
+       c.customer_age,
+       c.country_of_birth_code,
+       c.gender,
+       c.is_housewife,
+       c.days_from_eid_issued,
+       c.employment_info,
+       c.self_declared_salary,
+       c.source_of_funds,
+       c.customer_tenure_days,
+       c.customer_tenure_months,
+       -- Target label - credit card application submitted during the month
+       c.cc_application_sumbitted_TARGET_LABEL,
+       -- Subscription plan
+       sh.SUBSCRIPTION_NAME as subscription_plan,
+       -- Balance-related features
+       b.card_holder_category,
+       b.balance_aed,
+       b.current_account_balance,
+       b.savings_balance,
+       b.has_savings,
+       b.invest_balance,
+       b.has_invest,
+       b.total_balance_with_invest,
+       b.avg_balance_30d,
+       b.avg_balance_60d,
+       b.avg_balance_90d,
+       b.avg_balance_180d,
+       b.avg_balance_365d,
+       b.avg_balance_with_invest_30d,
+       b.avg_balance_with_invest_90d,
+       b.balance_trend_30d_vs_90d,
+       b.balance_trend_90d_vs_180d,
+       b.balance_mom_change,
+       -- Spenditure features
+       ROUND(sr.total_spend_debitcard_30d, 2) AS total_spend_debitcard_30d,
+       sr.num_spend_debitcard_30d,
+       ROUND(sr.daily_spend_online_30d, 2) AS daily_spend_online_30d,
+       ROUND(sr.daily_spend_pos_30d, 2) AS daily_spend_pos_30d,
+       ROUND(sr.daily_spend_wallet_30d, 2) AS daily_spend_wallet_30d,
+       ROUND(sr.cashback_on_debit_30d, 2) AS cashback_on_debit_30d,
+       ROUND(sp.spend_30d_debitcard, 2) AS spend_30d_debitcard,
+       ROUND(sp.spend_90d_debitcard, 2) AS spend_90d_debitcard,
+       ROUND(sp.spend_365d_debitcard, 2) AS spend_365d_debitcard,
+       ROUND(sp.spend_30d_total, 2) AS spend_30d_total,
+       ROUND(sp.spend_60d_total, 2) AS spend_60d_total,
+       ROUND(sp.spend_90d_total, 2) AS spend_90d_total,
+       ROUND(sp.spend_365d_total, 2) AS spend_365d_total,
+       ROUND(sp.avg_daily_spend_30d, 2) AS avg_daily_spend_30d,
+       ROUND(sp.avg_daily_spend_90d, 2) AS avg_daily_spend_90d,
+       ROUND(sp.spend_30d_domestic, 2) AS spend_30d_domestic,
+       ROUND(sp.spend_90d_domestic, 2) AS spend_90d_domestic,
+       sp.spend_acceleration_30d_vs_90d,
+       sp.international_spend_ratio_30d,
+       -- Salary features
+       ROUND(COALESCE(s.total_monthly_salary, 0), 2) AS received_monthly_total_salary,
+       COALESCE(s.prior_months_with_salary, 0) AS prior_months_with_salary,
+       ROUND(COALESCE(s.avg_salary_last_3_months, 0), 2) AS avg_salary_last_3_months,
+       ROUND(ti.salary_in_30d, 2) AS salary_in_30d,
+       ROUND(ti.salary_in_90d, 2) AS salary_in_90d,
+       ROUND(ti.salary_in_180d, 2) AS salary_in_180d,
+       ROUND(ti.salary_in_365d, 2) AS salary_in_365d,
+       ti.salary_count_30d,
+       ti.salary_count_90d,
+       -- ti.avg_salary_in_30d, -- All records 0
+       -- ti.avg_salary_in_90d, -- All records 0
+       ROUND(ti.total_inflows_30d, 2) - ROUND(ti.salary_in_30d, 2) AS non_salary_inflows_30d,
+       ROUND(ti.total_inflows_90d, 2) - ROUND(ti.salary_in_90d, 2) AS non_salary_inflows_90d,
+       ti.total_cash_deposit_30d,
+       ti.days_since_last_cash_deposit,
+       ti.total_value_local_transfer_in_30d,
+       ti.total_value_local_transfer_out_30d,
+       ti.total_value_international_transfer_in_30d,
+       ti.total_value_international_transfer_out_30d,
+       ti.total_value_atm_withdrawal_30d,
+       -- ti.days_since_last_cash_withdrawal, -- All records -1
+       ti.total_value_outflow_30d,
+       ti.total_value_outflow_90d,
+       ti.salary_regularity,
+       ti.avg_monthly_salary_90d,
+       ti.salary_to_outflow_ratio_30d,
+       ti.salary_to_outflow_ratio_90d,
+       CASE WHEN ti.salary_in_30d > 0 THEN sp.spend_30d_total/ti.salary_in_30d END AS salary_to_spend_ratio_30d,
+       CASE WHEN ti.salary_in_90d > 0 THEN sp.spend_90d_total/ti.salary_in_90d END AS salary_to_spend_ratio_90d,
+       -- Active loans
+       COALESCE(l.has_active_loan, False) AS has_active_loan,
+       COALESCE(l.num_active_loans, 0) AS num_active_loans,
+       l.total_loan_amount,
+       l.total_loan_outstanding,
+       l.total_loan_installments,
+       CASE WHEN s.avg_salary_last_3_months > 0 THEN l.total_loan_amount/s.avg_salary_last_3_months END AS loan_amount_to_salary_ratio,
+       CASE WHEN s.avg_salary_last_3_months > 0 THEN l.total_loan_outstanding/s.avg_salary_last_3_months END AS loan_outstanding_to_salary_ratio,
+       -- Loan application history
+       COALESCE(lah.num_prior_cc_applications, 0) AS num_prior_cc_applications,
+       COALESCE(lah.num_prior_pl_applications, 0) AS num_prior_pl_applications,
+       lah.months_since_last_application
+FROM customer_base c
+  LEFT JOIN salary s
+    ON c.customer_id = s.customer_id
+      AND c.month = s.month
+  LEFT JOIN prod.enterprise_db.customer_subscription_plan_history sh
+    ON c.customer_id = sh.CUSTOMER_BUSINESS_ID
+      AND c.month BETWEEN sh.SUBSCRIPTION_START_AT AND COALESCE(SUBSCRIPTION_END_AT, current_date())
+      AND sh.PRODUCT_TYPE = "RETAIL"
+  LEFT JOIN balances b
+    ON c.customer_id = b.customer_id
+      AND c.month = b.month
+  LEFT JOIN spending_rolling_window_filtered sr
+    ON c.customer_id = sr.customer_id
+      AND c.month = sr.month
+  LEFT JOIN spending sp
+    ON c.customer_id = sp.customer_id
+      AND c.month = sp.month
+  LEFT JOIN transfers_income ti
+    ON c.customer_id = ti.customer_id 
+      AND c.month = ti.month
+  LEFT JOIN loans l 
+    ON c.customer_id = l.customer_id
+      AND c.month = l.month
+  LEFT JOIN lending_application_history lah
+    ON c.customer_id = lah.customer_id
+      AND c.month = lah.month
+ORDER BY c.customer_id DESC, c.month ASC
